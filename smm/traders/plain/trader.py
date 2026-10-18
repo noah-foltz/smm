@@ -104,7 +104,8 @@ class PlainTrader(BaseTrader):
                 self.pricing_engine.consume_msg(msg)
             case OrderbookMsg():
                 self.pricing_engine.consume_msg(msg)
-                self.risk_engine.consume_msg(msg)
+                if msg.instrument == self.instrument:
+                    self.risk_engine.consume_msg(msg)
             case TickerMsg():
                 self.pricing_engine.consume_msg(msg)
             case PositionMsg():

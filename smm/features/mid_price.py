@@ -34,7 +34,7 @@ def weighted_mid_price(
     best_ask = asks[0]
     total_qty = best_bid.size + best_ask.size
 
-    if total_qty <= 0.0:
+    if total_qty <= 0.0 or best_bid.size <= 0.0 or best_ask.size <= 0.0:
         return (best_bid.price + best_ask.price) / 2.0
 
     return (best_bid.price * best_ask.size + best_ask.price * best_bid.size) / total_qty
@@ -59,7 +59,7 @@ def volume_adjusted_mid_price(
     Returns:
         float: Volume-adjusted mid price.
     """
-    if not bids or not asks:
+    if not bids or not asks or depth <= 0:
         return fallback_mid
 
     top_bids = bids[-depth:] if len(bids) > depth else bids

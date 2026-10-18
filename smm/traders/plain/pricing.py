@@ -63,6 +63,7 @@ class PlainPricingEngine(BasePricingEngine):
         self._position_size: float = 0.0
         self._wmid_price: float = 0.0
         self._cross_mid_price: float = 0.0
+        self._cross_update_ns: int = 0
         self._bba_imbalance: float = 0.0
         self._depth_imbalance: float = 0.0
         self._trade_flow = TradeFlowImbalance()
@@ -116,7 +117,8 @@ class PlainPricingEngine(BasePricingEngine):
                     best_ask = msg.asks[0].price
                     self._mid_price = (best_bid + best_ask) / 2.0
                     self._bba_imbalance = bba_imbalance(msg.bids, msg.asks)
-                    self._depth_imbalance = orderbook_imbalance(msg.bids, msg.asks)
+                    if not msg.is_bbo or self._depth_imbalance == 0.0:
+                        self._depth_imbalance = orderbook_imbalance(msg.bids, msg.asks)
                     self._wmid_price = weighted_mid_price(
                         msg.bids, msg.asks, fallback_mid=self._mid_price
                     )
@@ -128,15 +130,18 @@ class PlainPricingEngine(BasePricingEngine):
                         self._cross_mid_price = (
                             msg.bids[-1].price + msg.asks[0].price
                         ) / 2.0
+                        self._cross_update_ns = msg.moments.recv_time_ns
             case TickerMsg():
                 if msg.instrument == self.instrument:
-                    if self._mid_price <= 0.0:
-                        self._mid_price = msg.mid_price
+                    if self._mid_price <= 0.0 and msg.mark_price > 0.0:
+                        self._mid_price = msg.mark_price
                 elif (
                     self._cross_instrument is not None
                     and msg.instrument == self._cross_instrument
                 ):
-                    self._cross_mid_price = msg.mid_price
+                    if self._cross_mid_price <= 0.0 and msg.mark_price > 0.0:
+                        self._cross_mid_price = msg.mark_price
+                        self._cross_update_ns = msg.moments.recv_time_ns
             case PositionMsg():
                 if msg.instrument == self.instrument:
                     self._position_size = msg.size if msg.is_long else -msg.size

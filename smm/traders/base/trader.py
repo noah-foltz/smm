@@ -119,7 +119,9 @@ class BaseTrader(ABC):
 
         if config.cross_venue.enabled:
             cross_venue_bundle = load_venue_bundle(config.cross_venue.venue)
-            cross_exchange = cls._build_exchange(config.cross_venue.venue, logger)
+            cross_exchange = cls._build_exchange(
+                config.cross_venue.venue, logger, load_secrets=False
+            )
             cross_instrument = await cross_exchange.resolve_instrument(
                 config.cross_venue.symbol
             )
@@ -146,12 +148,15 @@ class BaseTrader(ABC):
         )
 
     @staticmethod
-    def _build_exchange(venue: Venue, logger: Logger) -> Exchange:
+    def _build_exchange(
+        venue: Venue, logger: Logger, load_secrets: bool = True
+    ) -> Exchange:
         """Build an exchange instance for a venue.
 
         Args:
             venue (Venue): Venue identifier.
             logger (Logger): Logger instance.
+            load_secrets (bool): Whether to load API credentials.
 
         Returns:
             Exchange: Exchange instance for the venue.
@@ -162,17 +167,17 @@ class BaseTrader(ABC):
 
                 return BinanceExchange(
                     logger=logger,
-                    load_secrets=True,
+                    load_secrets=load_secrets,
                     is_usd_margined=venue == Venue.BINANCE_USDM,
                 )
             case Venue.BYBIT:
                 from framework.bybit.trading.exchange import BybitExchange
 
-                return BybitExchange(logger=logger, load_secrets=True)
+                return BybitExchange(logger=logger, load_secrets=load_secrets)
             case Venue.OKX:
                 from framework.okx.trading.exchange import OkxExchange
 
-                return OkxExchange(logger=logger, load_secrets=True)
+                return OkxExchange(logger=logger, load_secrets=load_secrets)
             case _:
                 raise ValueError(f"Unsupported venue: {venue}")
 
@@ -272,8 +277,6 @@ class BaseTrader(ABC):
         tasks: list[asyncio.Task[None]] = []
         try:
             await self.exchange.connect_ws_client()
-            if self.cross_exchange is not None:
-                await self.cross_exchange.connect_ws_client()
 
             await self.market_data.start()
             await self.private_data.start()

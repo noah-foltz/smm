@@ -25,6 +25,7 @@ class TradeFlowImbalance:
         self.window_size = max(10, window_size)
         # Store tuples of (size, is_buy)
         self._trades: deque[tuple[float, bool]] = deque(maxlen=self.window_size)
+        self._cached_imbalance: float | None = None
 
     def update_trades(self, trades: Sequence[Trade]) -> None:
         """Append new trades to the sliding window.
@@ -32,14 +33,18 @@ class TradeFlowImbalance:
         Args:
             trades: Sequence of executed trades from TradeMsg.
         """
+        added = False
         for trade in trades:
             if trade.size > 0.0:
                 self._trades.append((trade.size, trade.is_buy))
+                added = True
+        if added:
+            self._cached_imbalance = None
 
     def clear(self) -> None:
         """Clear all stored trades."""
         self._trades.clear()
-
+        self._cached_imbalance = None
     @property
     def trade_count(self) -> int:
         """Current count of trades in the window."""
@@ -55,12 +60,16 @@ class TradeFlowImbalance:
             float: Imbalance in [-1.0, 1.0], where 1.0 indicates net buy aggression and
                 -1.0 indicates net sell aggression.
         """
+        if self._cached_imbalance is not None:
+            return self._cached_imbalance
+
         n = len(self._trades)
         if n == 0:
+            self._cached_imbalance = 0.0
             return 0.0
 
         # Weights: index 0 (oldest) has smallest weight, index n-1 (newest) has weight 1.0
-        # decay per step: exp(-0.01 * (n - 1 - i))
+        # decay per step: exp(-0.005 * (n - 1 - i))
         delta_buys = 0.0
         delta_sells = 0.0
 
@@ -76,6 +85,8 @@ class TradeFlowImbalance:
 
         total = delta_buys + delta_sells
         if total <= 0.0:
+            self._cached_imbalance = 0.0
             return 0.0
 
-        return max(-1.0, min(1.0, (delta_buys - delta_sells) / total))
+        self._cached_imbalance = max(-1.0, min(1.0, (delta_buys - delta_sells) / total))
+        return self._cached_imbalance

@@ -98,6 +98,8 @@ class StinkyTrader(BaseTrader):
         """
         if self.is_stale(msg, buffer_ms=250):
             return
+        if msg.instrument != self.instrument:
+            return
         match msg:
             case TradeMsg():
                 self.pricing_engine.consume_msg(msg)

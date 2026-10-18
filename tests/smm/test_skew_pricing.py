@@ -217,10 +217,80 @@ class TestSkewPricingEngine:
         desired = engine.generate_desired_state()
         bid_distance = engine.mid_price - desired.bids[0].price
         ask_distance = desired.asks[0].price - engine.mid_price
-
         # Cross venue is higher -> positive skew -> tighter bids, wider asks
         assert bid_distance < ask_distance
 
+    def test_ticker_msg_mark_price_fallback(self) -> None:
+        """TickerMsg with mark_price provides fallback mid without AttributeError."""
+        from framework.base.stream.models import TickerMsg
+        engine = _build_skew_pricing()
+        ticker_msg = make_msg(
+            TickerMsg,
+            engine.instrument,
+            mark_price=105.5,
+            index_price=105.4,
+            funding_rate=0.0001,
+            funding_period_min=480,
+            next_funding_time_ms=1700000000000,
+            open_interest=1000.0,
+            avg_volume_24h=50000.0,
+            price_chg_24h_pct=2.5,
+        )
+        engine.consume_msg(ticker_msg)
+        assert engine.mid_price == 105.5
+
+    def test_is_bbo_preserves_depth_imbalance(self) -> None:
+        """BBO messages with 1 level per side do not overwrite multi-depth imbalance."""
+        engine = _build_skew_pricing()
+        # Send full book with heavy depth bids
+        bids = (
+            OrderbookLevel(price=98.0, size=20.0),
+            OrderbookLevel(price=99.0, size=15.0),
+            OrderbookLevel(price=100.0, size=10.0),
+        )
+        asks = (
+            OrderbookLevel(price=101.0, size=1.0),
+            OrderbookLevel(price=102.0, size=1.0),
+            OrderbookLevel(price=103.0, size=1.0),
+        )
+        full_book = make_msg(
+            OrderbookMsg,
+            engine.instrument,
+            bids=bids,
+            asks=asks,
+            is_bbo=False,
+        )
+        engine.consume_msg(full_book)
+        depth_before = engine.depth_imbalance_value
+        assert depth_before > 0.5
+
+        # Send subsequent 1-level BBO message
+        bbo_msg = make_msg(
+            OrderbookMsg,
+            engine.instrument,
+            bids=(OrderbookLevel(price=100.0, size=2.0),),
+            asks=(OrderbookLevel(price=101.0, size=2.0),),
+            is_bbo=True,
+        )
+        engine.consume_msg(bbo_msg)
+
+        # BBA updated to 0.0, but depth imbalance was preserved
+        assert engine.bba_imbalance_value == 0.0
+        assert engine.depth_imbalance_value == depth_before
+
+    def test_zero_size_wmid_fallback(self) -> None:
+        """Zero size BBO levels safely fall back to arithmetic mid."""
+        from smm.features import weighted_mid_price
+        bids = (OrderbookLevel(price=100.0, size=0.0),)
+        asks = (OrderbookLevel(price=102.0, size=5.0),)
+        assert weighted_mid_price(bids, asks) == 101.0
+
+    def test_volume_adjusted_mid_price_depth_zero(self) -> None:
+        """VAMP with depth <= 0 safely returns fallback mid."""
+        from smm.features import volume_adjusted_mid_price
+        bids = (OrderbookLevel(price=100.0, size=5.0),)
+        asks = (OrderbookLevel(price=102.0, size=5.0),)
+        assert volume_adjusted_mid_price(bids, asks, depth=0, fallback_mid=101.0) == 101.0
 
 class TestConfigValidation:
     """Tests for new configuration fields and validation."""
