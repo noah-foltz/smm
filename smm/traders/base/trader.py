@@ -118,6 +118,14 @@ class BaseTrader(ABC):
         cross_market_data: MarketStreamManager | None = None
 
         if config.cross_venue.enabled:
+            if (
+                config.cross_venue.venue == config.core.venue
+                and config.cross_venue.symbol == config.core.symbol
+            ):
+                raise ValueError(
+                    f"cross_venue ({config.cross_venue.venue}, {config.cross_venue.symbol}) "
+                    f"cannot match primary venue and symbol"
+                )
             cross_venue_bundle = load_venue_bundle(config.cross_venue.venue)
             cross_exchange = cls._build_exchange(
                 config.cross_venue.venue, logger, load_secrets=False

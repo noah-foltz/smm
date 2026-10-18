@@ -278,6 +278,104 @@ class TestSkewPricingEngine:
         assert engine.bba_imbalance_value == 0.0
         assert engine.depth_imbalance_value == depth_before
 
+    def test_symmetric_full_book_not_overwritten_by_bbo(self) -> None:
+        """Finding 1: A balanced full book (depth imbalance = 0.0) is not overwritten by a subsequent BBO tick."""
+        engine = _build_skew_pricing()
+        # Symmetric full book
+        bids = (
+            OrderbookLevel(price=98.0, size=5.0),
+            OrderbookLevel(price=99.0, size=5.0),
+            OrderbookLevel(price=100.0, size=5.0),
+        )
+        asks = (
+            OrderbookLevel(price=101.0, size=5.0),
+            OrderbookLevel(price=102.0, size=5.0),
+            OrderbookLevel(price=103.0, size=5.0),
+        )
+        full_book = make_msg(
+            OrderbookMsg,
+            engine.instrument,
+            bids=bids,
+            asks=asks,
+            is_bbo=False,
+        )
+        engine.consume_msg(full_book)
+        assert engine.depth_imbalance_value == 0.0
+        assert engine._has_full_depth is True
+
+        # Next comes a heavily skewed 1-level BBO message (bids 100 vs asks 1)
+        bbo_msg = make_msg(
+            OrderbookMsg,
+            engine.instrument,
+            bids=(OrderbookLevel(price=100.0, size=100.0),),
+            asks=(OrderbookLevel(price=101.0, size=1.0),),
+            is_bbo=True,
+        )
+        engine.consume_msg(bbo_msg)
+        assert engine.bba_imbalance_value > 0.9
+        # depth imbalance remains 0.0 because full book was already observed!
+        assert engine.depth_imbalance_value == 0.0
+
+    def test_initial_bbo_not_latched(self) -> None:
+        """Finding 1: Consecutive BBO messages before any full book arrives keep updating depth imbalance."""
+        engine = _build_skew_pricing()
+        # First BBO message
+        bbo_1 = make_msg(
+            OrderbookMsg,
+            engine.instrument,
+            bids=(OrderbookLevel(price=100.0, size=10.0),),
+            asks=(OrderbookLevel(price=101.0, size=2.0),),
+            is_bbo=True,
+        )
+        engine.consume_msg(bbo_1)
+        assert engine.depth_imbalance_value > 0.0
+
+        # Second BBO message with reversed pressure before any full book arrived
+        bbo_2 = make_msg(
+            OrderbookMsg,
+            engine.instrument,
+            bids=(OrderbookLevel(price=100.0, size=2.0),),
+            asks=(OrderbookLevel(price=101.0, size=10.0),),
+            is_bbo=True,
+        )
+        engine.consume_msg(bbo_2)
+        # Should NOT be latched/frozen at the first BBO's positive value
+        assert engine.depth_imbalance_value < 0.0
+
+    def test_cross_venue_staleness_drop(self) -> None:
+        """Finding 2: Stale cross-venue mid price is ignored in skew calculation."""
+        cross_inst = _make_cross_instrument()
+        engine = _build_skew_pricing(
+            use_wmid=False, skew_intensity=0.5, cross_instrument=cross_inst
+        )
+        # Local book at 100.0, recv_ns = 1_000_000_000
+        bids = (OrderbookLevel(price=99.0, size=5.0),)
+        asks = (OrderbookLevel(price=101.0, size=5.0),)
+        engine.consume_msg(
+            make_msg(OrderbookMsg, engine.instrument, bids=bids, asks=asks, recv_ns=1_000_000_000, is_bbo=False)
+        )
+
+        # Cross venue book at 101.0 mid, recv_ns = 1_000_000_000
+        cross_bids = (OrderbookLevel(price=100.5, size=5.0),)
+        cross_asks = (OrderbookLevel(price=101.5, size=5.0),)
+        engine.consume_msg(
+            make_msg(OrderbookMsg, cross_inst, bids=cross_bids, asks=cross_asks, recv_ns=1_000_000_000, is_bbo=False)
+        )
+        # When fresh, cross venue produces positive skew
+        fresh_state = engine.generate_desired_state()
+        assert (engine.mid_price - fresh_state.bids[0].price) < (fresh_state.asks[0].price - engine.mid_price)
+
+        # Now simulate 10 seconds passing on the primary venue without any cross-venue update
+        engine.consume_msg(
+            make_msg(OrderbookMsg, engine.instrument, bids=bids, asks=asks, recv_ns=11_000_000_000, is_bbo=False)
+        )
+        stale_state = engine.generate_desired_state()
+        # Since cross quote is now 10 seconds old (> 5.0s max age), cross spread drops to 0.0
+        # With symmetric local book and 0 trade flow, spreads should be symmetric!
+        stale_bid_dist = engine.mid_price - stale_state.bids[0].price
+        stale_ask_dist = stale_state.asks[0].price - engine.mid_price
+        assert math.isclose(stale_bid_dist, stale_ask_dist, abs_tol=1e-5)
+
     def test_zero_size_wmid_fallback(self) -> None:
         """Zero size BBO levels safely fall back to arithmetic mid."""
         from smm.features import weighted_mid_price
@@ -291,7 +389,6 @@ class TestSkewPricingEngine:
         bids = (OrderbookLevel(price=100.0, size=5.0),)
         asks = (OrderbookLevel(price=102.0, size=5.0),)
         assert volume_adjusted_mid_price(bids, asks, depth=0, fallback_mid=101.0) == 101.0
-
 class TestConfigValidation:
     """Tests for new configuration fields and validation."""
 
@@ -323,3 +420,18 @@ class TestConfigValidation:
         # Disabled with empty symbol is fine
         cfg = CrossVenueConfig(enabled=False, symbol="")
         assert not cfg.enabled
+
+    def test_cross_venue_matching_primary_raises(self) -> None:
+        """Finding 3: AppConfig rejects cross_venue matching primary venue and symbol."""
+        from smm.config import AppConfig, CoreConfig, TraderId
+        with pytest.raises(ValueError, match="cannot match primary"):
+            AppConfig(
+                core=CoreConfig(venue=Venue.BYBIT, symbol="SOLUSDT", trader=TraderId.PLAIN),
+                pricing=PricingConfig(
+                    levels=5,
+                    base_spread_bps=10.0,
+                    max_inventory_quote=100.0,
+                    inventory_spread_ladder=[],
+                ),
+                cross_venue=CrossVenueConfig(enabled=True, venue=Venue.BYBIT, symbol="SOLUSDT"),
+            )

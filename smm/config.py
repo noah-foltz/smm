@@ -115,7 +115,7 @@ class PricingConfig(msgspec.Struct):
     trade_flow_weight: float = 0.25
     cross_venue_weight: float = 0.25
     inventory_skew_weight: float = 0.5
-
+    cross_venue_max_age_s: float = 5.0
     def __post_init__(self) -> None:
         """Validate pricing settings."""
         if self.levels <= 0:
@@ -134,6 +134,8 @@ class PricingConfig(msgspec.Struct):
             raise ValueError("trade_flow_weight must be >= 0")
         if self.cross_venue_weight < 0.0:
             raise ValueError("cross_venue_weight must be >= 0")
+        if self.cross_venue_max_age_s <= 0.0:
+            raise ValueError("cross_venue_max_age_s must be > 0")
         if not (0.0 <= self.inventory_skew_weight <= 1.0):
             raise ValueError("inventory_skew_weight must be within [0, 1]")
 
@@ -305,6 +307,18 @@ class AppConfig(msgspec.Struct):
     plain: PlainConfig = msgspec.field(default_factory=PlainConfig)
     stinky: StinkyConfig = msgspec.field(default_factory=StinkyConfig)
     cross_venue: CrossVenueConfig = msgspec.field(default_factory=CrossVenueConfig)
+
+    def __post_init__(self) -> None:
+        """Validate composite configuration invariants."""
+        if self.cross_venue.enabled:
+            if (
+                self.cross_venue.venue == self.core.venue
+                and self.cross_venue.symbol == self.core.symbol
+            ):
+                raise ValueError(
+                    f"cross_venue ({self.cross_venue.venue}, {self.cross_venue.symbol}) "
+                    f"cannot match primary venue and symbol"
+                )
 
 
 def load_config(path: str | Path) -> AppConfig:

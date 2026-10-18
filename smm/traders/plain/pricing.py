@@ -64,6 +64,8 @@ class PlainPricingEngine(BasePricingEngine):
         self._wmid_price: float = 0.0
         self._cross_mid_price: float = 0.0
         self._cross_update_ns: int = 0
+        self._last_primary_time_ns: int = 0
+        self._has_full_depth: bool = False
         self._bba_imbalance: float = 0.0
         self._depth_imbalance: float = 0.0
         self._trade_flow = TradeFlowImbalance()
@@ -107,17 +109,22 @@ class PlainPricingEngine(BasePricingEngine):
         match msg:
             case TradeMsg():
                 if msg.instrument == self.instrument:
+                    self._last_primary_time_ns = msg.moments.recv_time_ns
                     self._volatility.update_msg(msg)
                     self._trade_flow.update_trades(msg.trades)
             case OrderbookMsg():
                 if msg.instrument == self.instrument:
+                    self._last_primary_time_ns = msg.moments.recv_time_ns
                     if not msg.bids or not msg.asks:
                         return
                     best_bid = msg.bids[-1].price
                     best_ask = msg.asks[0].price
                     self._mid_price = (best_bid + best_ask) / 2.0
                     self._bba_imbalance = bba_imbalance(msg.bids, msg.asks)
-                    if not msg.is_bbo or self._depth_imbalance == 0.0:
+                    if not msg.is_bbo:
+                        self._has_full_depth = True
+                        self._depth_imbalance = orderbook_imbalance(msg.bids, msg.asks)
+                    elif not self._has_full_depth:
                         self._depth_imbalance = orderbook_imbalance(msg.bids, msg.asks)
                     self._wmid_price = weighted_mid_price(
                         msg.bids, msg.asks, fallback_mid=self._mid_price
@@ -133,6 +140,7 @@ class PlainPricingEngine(BasePricingEngine):
                         self._cross_update_ns = msg.moments.recv_time_ns
             case TickerMsg():
                 if msg.instrument == self.instrument:
+                    self._last_primary_time_ns = msg.moments.recv_time_ns
                     if self._mid_price <= 0.0 and msg.mark_price > 0.0:
                         self._mid_price = msg.mark_price
                 elif (
@@ -241,13 +249,24 @@ class PlainPricingEngine(BasePricingEngine):
         """Calculate aggregate skew from micro-features and inventory."""
         trade_imb = self._trade_flow.imbalance()
         cross_spread = 0.0
-        if self._cross_mid_price > 0.0 and self._mid_price > 0.0:
+        is_cross_fresh = False
+        if self._cross_mid_price > 0.0 and self._cross_update_ns > 0:
+            ref_time_ns = self._last_primary_time_ns
+            if ref_time_ns <= 0:
+                from mm_toolbox.time import time_ns
+
+                ref_time_ns = time_ns()
+            age_s = max(0.0, (ref_time_ns - self._cross_update_ns) / 1e9)
+            if age_s <= self.config.cross_venue_max_age_s:
+                is_cross_fresh = True
+
+        if is_cross_fresh and self._mid_price > 0.0:
             diff = log_price_difference(self._cross_mid_price, self._mid_price)
             # Normalize 50 bps (0.50%) deviation to approximately [-1.0, 1.0]
             cross_spread = max(-1.0, min(1.0, diff / 0.5))
 
         active_cross_weight = (
-            self.config.cross_venue_weight if self._cross_mid_price > 0.0 else 0.0
+            self.config.cross_venue_weight if is_cross_fresh else 0.0
         )
         total_signal_weight = (
             self.config.bba_imbalance_weight
@@ -255,7 +274,6 @@ class PlainPricingEngine(BasePricingEngine):
             + self.config.trade_flow_weight
             + active_cross_weight
         )
-
         if total_signal_weight > 0.0:
             signal_skew = (
                 self._bba_imbalance * self.config.bba_imbalance_weight
