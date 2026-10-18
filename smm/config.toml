@@ -22,12 +22,25 @@ inventory_spread_ladder = [
   [2.0, 0.5],
   [3.0, 0.8],
 ]
+use_wmid = true
+skew_intensity = 0.5
+bba_imbalance_weight = 0.25
+orderbook_imbalance_weight = 0.25
+trade_flow_weight = 0.25
+cross_venue_weight = 0.25
+inventory_skew_weight = 0.5
+
+# Cross-venue reference stream (e.g. Binance lead-lag stream when trading Bybit)
+[cross_venue]
+enabled = false
+venue = "BinanceUsdM"
+symbol = "SOLUSDT"
 
 # Risk settings
 [risk]
 max_inventory_quote = 500.0
 max_open_orders = 10
-max_order_distance_pct = 1.0
+max_order_distance_pct = 5.0
 
 # OMS budgets
 [oms]

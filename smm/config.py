@@ -95,13 +95,27 @@ class PricingConfig(msgspec.Struct):
         base_spread_bps (float): Base spread in bps.
         max_inventory_quote (float): Max inventory in quote terms.
         inventory_spread_ladder (list[tuple[float, float]]): Spread multipliers by utilization.
+        use_wmid (bool): Whether to center quotes around volume-weighted mid-price.
+        skew_intensity (float): Scaling factor in [0, 1] for asymmetric quote skewing.
+        bba_imbalance_weight (float): Weight for top-of-book BBA volume imbalance.
+        orderbook_imbalance_weight (float): Weight for multi-depth orderbook imbalance.
+        trade_flow_weight (float): Weight for directional trade flow imbalance.
+        cross_venue_weight (float): Weight for cross-venue reference spread signal.
+        inventory_skew_weight (float): Weight for inventory balancing skew relative to signal.
     """
 
     levels: int
     base_spread_bps: float
     max_inventory_quote: float
     inventory_spread_ladder: list[tuple[float, float]]
-
+    use_wmid: bool = False
+    skew_intensity: float = 0.0
+    bba_imbalance_weight: float = 0.25
+    orderbook_imbalance_weight: float = 0.25
+    trade_flow_weight: float = 0.25
+    cross_venue_weight: float = 0.25
+    inventory_skew_weight: float = 0.5
+    cross_venue_max_age_s: float = 5.0
     def __post_init__(self) -> None:
         """Validate pricing settings."""
         if self.levels <= 0:
@@ -110,6 +124,20 @@ class PricingConfig(msgspec.Struct):
             raise ValueError("base_spread_bps must be >= 0")
         if self.max_inventory_quote <= 0.0:
             raise ValueError("max_inventory_quote must be > 0")
+        if not (0.0 <= self.skew_intensity <= 1.0):
+            raise ValueError("skew_intensity must be within [0, 1]")
+        if self.bba_imbalance_weight < 0.0:
+            raise ValueError("bba_imbalance_weight must be >= 0")
+        if self.orderbook_imbalance_weight < 0.0:
+            raise ValueError("orderbook_imbalance_weight must be >= 0")
+        if self.trade_flow_weight < 0.0:
+            raise ValueError("trade_flow_weight must be >= 0")
+        if self.cross_venue_weight < 0.0:
+            raise ValueError("cross_venue_weight must be >= 0")
+        if self.cross_venue_max_age_s <= 0.0:
+            raise ValueError("cross_venue_max_age_s must be > 0")
+        if not (0.0 <= self.inventory_skew_weight <= 1.0):
+            raise ValueError("inventory_skew_weight must be within [0, 1]")
 
         ladder: list[tuple[float, float]] = []
         for entry in self.inventory_spread_ladder:
@@ -122,7 +150,6 @@ class PricingConfig(msgspec.Struct):
                 raise ValueError("inventory utilization must be within [0, 1]")
             ladder.append((multiplier, util))
         self.inventory_spread_ladder = sorted(ladder, key=lambda x: x[1])
-
 
 class RiskConfig(msgspec.Struct):
     """Risk controls enforced by the risk engine.
@@ -240,6 +267,24 @@ class StinkyConfig(msgspec.Struct):
         if not self.cloid_prefix.strip():
             raise ValueError("cloid_prefix must be non-empty")
 
+class CrossVenueConfig(msgspec.Struct):
+    """Configuration for secondary cross-venue reference stream.
+
+    Attributes:
+        enabled (bool): Whether to stream from a secondary reference venue.
+        venue (Venue): Secondary exchange venue.
+        symbol (Symbol): Secondary instrument symbol string.
+    """
+
+    enabled: bool = False
+    venue: Venue = Venue.BINANCE_USDM
+    symbol: Symbol = ""
+
+    def __post_init__(self) -> None:
+        """Validate cross-venue configuration."""
+        if self.enabled and not self.symbol.strip():
+            raise ValueError("cross_venue symbol must be non-empty when enabled")
+
 
 class AppConfig(msgspec.Struct):
     """Top-level configuration for the SMM trader runtime.
@@ -261,6 +306,19 @@ class AppConfig(msgspec.Struct):
     oms: OmsConfig = msgspec.field(default_factory=OmsConfig)
     plain: PlainConfig = msgspec.field(default_factory=PlainConfig)
     stinky: StinkyConfig = msgspec.field(default_factory=StinkyConfig)
+    cross_venue: CrossVenueConfig = msgspec.field(default_factory=CrossVenueConfig)
+
+    def __post_init__(self) -> None:
+        """Validate composite configuration invariants."""
+        if self.cross_venue.enabled:
+            if (
+                self.cross_venue.venue == self.core.venue
+                and self.cross_venue.symbol == self.core.symbol
+            ):
+                raise ValueError(
+                    f"cross_venue ({self.cross_venue.venue}, {self.cross_venue.symbol}) "
+                    f"cannot match primary venue and symbol"
+                )
 
 
 def load_config(path: str | Path) -> AppConfig:

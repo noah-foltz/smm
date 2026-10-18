@@ -28,6 +28,7 @@ from smm.traders.plain.risk import PlainRiskEngine
 class PlainTrader(BaseTrader):
     """Trader for the plain strategy."""
 
+    supports_cross_venue: bool = True
     oms: PlainOrderManagementSystem
 
     def __init__(
@@ -40,6 +41,9 @@ class PlainTrader(BaseTrader):
         market_data,
         private_data,
         producer_buffer,
+        cross_exchange=None,
+        cross_instrument=None,
+        cross_market_data=None,
     ) -> None:
         """Initialize the plain trader.
 
@@ -52,6 +56,9 @@ class PlainTrader(BaseTrader):
             market_data (MarketDataStream): Market data stream.
             private_data (PrivateDataStream): Private data stream.
             producer_buffer: Ring buffer for stream messages.
+            cross_exchange: Optional secondary exchange client.
+            cross_instrument: Optional secondary reference instrument.
+            cross_market_data: Optional secondary market data stream.
         """
         super().__init__(
             config=config,
@@ -62,6 +69,9 @@ class PlainTrader(BaseTrader):
             market_data=market_data,
             private_data=private_data,
             producer_buffer=producer_buffer,
+            cross_exchange=cross_exchange,
+            cross_instrument=cross_instrument,
+            cross_market_data=cross_market_data,
         )
 
         self.volatility = VolatilityEstimator(config.volatility)
@@ -71,6 +81,7 @@ class PlainTrader(BaseTrader):
             plain_config=config.plain,
             rounder=rounder,
             volatility=self.volatility,
+            cross_instrument=cross_instrument,
         )
         self.risk_engine = PlainRiskEngine(config=config.risk)
         self.oms = PlainOrderManagementSystem(
@@ -94,7 +105,8 @@ class PlainTrader(BaseTrader):
                 self.pricing_engine.consume_msg(msg)
             case OrderbookMsg():
                 self.pricing_engine.consume_msg(msg)
-                self.risk_engine.consume_msg(msg)
+                if msg.instrument == self.instrument:
+                    self.risk_engine.consume_msg(msg)
             case TickerMsg():
                 self.pricing_engine.consume_msg(msg)
             case PositionMsg():

@@ -18,6 +18,7 @@ from framework.base.stream.models import (
     DataMsg,
     DataStreamEvent,
     DataStreamEventMsg,
+    MarketDataStreamType,
 )
 from framework.base.trading.exchange import Exchange
 from framework.loader import VenueBundle, load_venue_bundle
@@ -46,6 +47,7 @@ class BaseTrader(ABC):
         producer_buffer (GenericRingBuffer): Stream ring buffer.
         oms (BaseOrderManagementSystem | None): OMS implementation.
     """
+    supports_cross_venue: bool = False
 
     def __init__(
         self,
@@ -57,6 +59,9 @@ class BaseTrader(ABC):
         market_data: MarketStreamManager,
         private_data: PrivateStreamManager,
         producer_buffer: GenericRingBuffer,
+        cross_exchange: Exchange | None = None,
+        cross_instrument: Instrument | None = None,
+        cross_market_data: MarketStreamManager | None = None,
     ) -> None:
         """Initialize the trader with runtime dependencies.
 
@@ -69,7 +74,9 @@ class BaseTrader(ABC):
             market_data (MarketStreamManager): Market data stream manager.
             private_data (PrivateStreamManager): Private data stream manager.
             producer_buffer (GenericRingBuffer): Ring buffer for stream messages.
-
+            cross_exchange (Exchange | None): Optional secondary exchange client.
+            cross_instrument (Instrument | None): Optional secondary instrument.
+            cross_market_data (MarketStreamManager | None): Optional secondary market stream manager.
         """
         self.config = config
         self.logger = logger
@@ -79,6 +86,9 @@ class BaseTrader(ABC):
         self.market_data = market_data
         self.private_data = private_data
         self.producer_buffer = producer_buffer
+        self.cross_exchange = cross_exchange
+        self.cross_instrument = cross_instrument
+        self.cross_market_data = cross_market_data
 
         self.oms: BaseOrderManagementSystem | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -96,15 +106,56 @@ class BaseTrader(ABC):
         """
         venue_bundle = load_venue_bundle(config.core.venue)
         exchange = cls._build_exchange(config.core.venue, logger)
-        instrument = await exchange.resolve_instrument(config.core.symbol)
-        rounder = await cls._build_rounder(exchange, instrument)
-        buffer: GenericRingBuffer = GenericRingBuffer(STREAM_MESSAGE_BUFFER_CAPACITY)
-        market_data = await cls._build_market_data(
-            venue_bundle, config.core.venue, exchange, logger, buffer
-        )
-        private_data = await cls._build_private_data(
-            venue_bundle, config.core.venue, exchange, logger, buffer
-        )
+        cross_exchange: Exchange | None = None
+        try:
+            instrument = await exchange.resolve_instrument(config.core.symbol)
+            rounder = await cls._build_rounder(exchange, instrument)
+            buffer: GenericRingBuffer = GenericRingBuffer(STREAM_MESSAGE_BUFFER_CAPACITY)
+            market_data = await cls._build_market_data(
+                venue_bundle, config.core.venue, exchange, logger, buffer
+            )
+            private_data = await cls._build_private_data(
+                venue_bundle, config.core.venue, exchange, logger, buffer
+            )
+            cross_instrument: Instrument | None = None
+            cross_market_data: MarketStreamManager | None = None
+
+            if config.cross_venue.enabled and cls.supports_cross_venue:
+                if (
+                    config.cross_venue.venue == config.core.venue
+                    and config.cross_venue.symbol == config.core.symbol
+                ):
+                    raise ValueError(
+                        f"cross_venue ({config.cross_venue.venue}, {config.cross_venue.symbol}) "
+                        f"cannot match primary venue and symbol"
+                    )
+                cross_venue_bundle = load_venue_bundle(config.cross_venue.venue)
+                cross_exchange = cls._build_exchange(
+                    config.cross_venue.venue, logger, load_secrets=False
+                )
+                cross_instrument = await cross_exchange.resolve_instrument(
+                    config.cross_venue.symbol
+                )
+                if (
+                    cross_instrument.base != instrument.base
+                    or cross_instrument.quote != instrument.quote
+                ):
+                    raise ValueError(
+                        f"cross_venue asset pair ({cross_instrument.base}/{cross_instrument.quote}) "
+                        f"must match primary asset pair ({instrument.base}/{instrument.quote})"
+                    )
+                cross_market_data = await cls._build_market_data(
+                    cross_venue_bundle,
+                    config.cross_venue.venue,
+                    cross_exchange,
+                    logger,
+                    buffer,
+                )
+        except Exception:
+            await exchange.close_clients()
+            if cross_exchange is not None:
+                await cross_exchange.close_clients()
+            raise
         return cls(
             config=config,
             logger=logger,
@@ -114,15 +165,21 @@ class BaseTrader(ABC):
             market_data=market_data,
             private_data=private_data,
             producer_buffer=buffer,
+            cross_exchange=cross_exchange,
+            cross_instrument=cross_instrument,
+            cross_market_data=cross_market_data,
         )
 
     @staticmethod
-    def _build_exchange(venue: Venue, logger: Logger) -> Exchange:
+    def _build_exchange(
+        venue: Venue, logger: Logger, load_secrets: bool = True
+    ) -> Exchange:
         """Build an exchange instance for a venue.
 
         Args:
             venue (Venue): Venue identifier.
             logger (Logger): Logger instance.
+            load_secrets (bool): Whether to load API credentials.
 
         Returns:
             Exchange: Exchange instance for the venue.
@@ -133,17 +190,17 @@ class BaseTrader(ABC):
 
                 return BinanceExchange(
                     logger=logger,
-                    load_secrets=True,
+                    load_secrets=load_secrets,
                     is_usd_margined=venue == Venue.BINANCE_USDM,
                 )
             case Venue.BYBIT:
                 from framework.bybit.trading.exchange import BybitExchange
 
-                return BybitExchange(logger=logger, load_secrets=True)
+                return BybitExchange(logger=logger, load_secrets=load_secrets)
             case Venue.OKX:
                 from framework.okx.trading.exchange import OkxExchange
 
-                return OkxExchange(logger=logger, load_secrets=True)
+                return OkxExchange(logger=logger, load_secrets=load_secrets)
             case _:
                 raise ValueError(f"Unsupported venue: {venue}")
 
@@ -243,8 +300,16 @@ class BaseTrader(ABC):
         tasks: list[asyncio.Task[None]] = []
         try:
             await self.exchange.connect_ws_client()
+
             await self.market_data.start()
             await self.private_data.start()
+            if self.cross_market_data is not None and self.cross_instrument is not None:
+                await self.cross_market_data.start()
+                await self.cross_market_data.subscribe(
+                    instruments=[self.cross_instrument],
+                    stream_types={MarketDataStreamType.TOP_OF_ORDERBOOK},
+                )
+
             await self.market_data.subscribe(
                 instruments=[self.instrument],
                 stream_types=ALL_MARKET_DATA_STREAM_TYPES,
@@ -275,7 +340,8 @@ class BaseTrader(ABC):
                     await self.received_heartbeat(msg)
                 case _:
                     await self.consume_msg(msg)
-                    await self.update_state()
+                    if getattr(msg, "instrument", self.instrument) == self.instrument:
+                        await self.update_state()
 
     @final
     async def received_heartbeat(self, msg: DataStreamEventMsg) -> None:
@@ -327,16 +393,21 @@ class BaseTrader(ABC):
 
     async def shutdown(self) -> None:
         """Shutdown internal components and close clients."""
-        await asyncio.gather(
+        stop_tasks = [
             self.market_data.stop(),
             self.private_data.stop(),
-            return_exceptions=True,
-        )
+        ]
+        if self.cross_market_data is not None:
+            stop_tasks.append(self.cross_market_data.stop())
+        await asyncio.gather(*stop_tasks, return_exceptions=True)
+
         if self.oms is not None:
             await self.oms.kill_switch()
-        await self.exchange.close_clients()
-        self.logger.shutdown()
 
+        await self.exchange.close_clients()
+        if self.cross_exchange is not None:
+            await self.cross_exchange.close_clients()
+        self.logger.shutdown()
     @abstractmethod
     async def consume_msg(self, msg: DataMsg) -> None:
         """Consume a data message from the streams.
