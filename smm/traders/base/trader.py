@@ -57,6 +57,9 @@ class BaseTrader(ABC):
         market_data: MarketStreamManager,
         private_data: PrivateStreamManager,
         producer_buffer: GenericRingBuffer,
+        cross_exchange: Exchange | None = None,
+        cross_instrument: Instrument | None = None,
+        cross_market_data: MarketStreamManager | None = None,
     ) -> None:
         """Initialize the trader with runtime dependencies.
 
@@ -69,7 +72,9 @@ class BaseTrader(ABC):
             market_data (MarketStreamManager): Market data stream manager.
             private_data (PrivateStreamManager): Private data stream manager.
             producer_buffer (GenericRingBuffer): Ring buffer for stream messages.
-
+            cross_exchange (Exchange | None): Optional secondary exchange client.
+            cross_instrument (Instrument | None): Optional secondary instrument.
+            cross_market_data (MarketStreamManager | None): Optional secondary market stream manager.
         """
         self.config = config
         self.logger = logger
@@ -79,6 +84,9 @@ class BaseTrader(ABC):
         self.market_data = market_data
         self.private_data = private_data
         self.producer_buffer = producer_buffer
+        self.cross_exchange = cross_exchange
+        self.cross_instrument = cross_instrument
+        self.cross_market_data = cross_market_data
 
         self.oms: BaseOrderManagementSystem | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -105,6 +113,24 @@ class BaseTrader(ABC):
         private_data = await cls._build_private_data(
             venue_bundle, config.core.venue, exchange, logger, buffer
         )
+        cross_exchange: Exchange | None = None
+        cross_instrument: Instrument | None = None
+        cross_market_data: MarketStreamManager | None = None
+
+        if config.cross_venue.enabled:
+            cross_venue_bundle = load_venue_bundle(config.cross_venue.venue)
+            cross_exchange = cls._build_exchange(config.cross_venue.venue, logger)
+            cross_instrument = await cross_exchange.resolve_instrument(
+                config.cross_venue.symbol
+            )
+            cross_market_data = await cls._build_market_data(
+                cross_venue_bundle,
+                config.cross_venue.venue,
+                cross_exchange,
+                logger,
+                buffer,
+            )
+
         return cls(
             config=config,
             logger=logger,
@@ -114,6 +140,9 @@ class BaseTrader(ABC):
             market_data=market_data,
             private_data=private_data,
             producer_buffer=buffer,
+            cross_exchange=cross_exchange,
+            cross_instrument=cross_instrument,
+            cross_market_data=cross_market_data,
         )
 
     @staticmethod
@@ -243,8 +272,18 @@ class BaseTrader(ABC):
         tasks: list[asyncio.Task[None]] = []
         try:
             await self.exchange.connect_ws_client()
+            if self.cross_exchange is not None:
+                await self.cross_exchange.connect_ws_client()
+
             await self.market_data.start()
             await self.private_data.start()
+            if self.cross_market_data is not None and self.cross_instrument is not None:
+                await self.cross_market_data.start()
+                await self.cross_market_data.subscribe(
+                    instruments=[self.cross_instrument],
+                    stream_types=ALL_MARKET_DATA_STREAM_TYPES,
+                )
+
             await self.market_data.subscribe(
                 instruments=[self.instrument],
                 stream_types=ALL_MARKET_DATA_STREAM_TYPES,
@@ -327,16 +366,21 @@ class BaseTrader(ABC):
 
     async def shutdown(self) -> None:
         """Shutdown internal components and close clients."""
-        await asyncio.gather(
+        stop_tasks = [
             self.market_data.stop(),
             self.private_data.stop(),
-            return_exceptions=True,
-        )
+        ]
+        if self.cross_market_data is not None:
+            stop_tasks.append(self.cross_market_data.stop())
+        await asyncio.gather(*stop_tasks, return_exceptions=True)
+
         if self.oms is not None:
             await self.oms.kill_switch()
-        await self.exchange.close_clients()
-        self.logger.shutdown()
 
+        await self.exchange.close_clients()
+        if self.cross_exchange is not None:
+            await self.cross_exchange.close_clients()
+        self.logger.shutdown()
     @abstractmethod
     async def consume_msg(self, msg: DataMsg) -> None:
         """Consume a data message from the streams.
