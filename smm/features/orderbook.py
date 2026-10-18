@@ -6,6 +6,7 @@ imbalance across basis-point depth horizons with exponential decay weights.
 
 from __future__ import annotations
 
+from functools import lru_cache
 import math
 from typing import Sequence
 
@@ -13,6 +14,13 @@ from framework.base.stream.models import OrderbookLevel
 
 DEFAULT_DEPTHS_BPS: tuple[float, ...] = (10.0, 25.0, 50.0, 100.0, 200.0, 500.0)
 
+
+@lru_cache(maxsize=16)
+def _depth_weights(num_depths: int) -> tuple[float, ...]:
+    """Precompute normalized exponential decay weights for depth tiers."""
+    raw_weights = [math.exp(-0.5 * i) for i in range(num_depths)]
+    sum_weights = sum(raw_weights)
+    return tuple(w / sum_weights for w in raw_weights)
 
 def bba_imbalance(
     bids: Sequence[OrderbookLevel],
@@ -72,30 +80,37 @@ def orderbook_imbalance(
     if best_bid_p <= 0.0 or best_ask_p <= 0.0:
         return 0.0
 
-    num_depths = len(depths_bps)
-    # Generate normalized EMA weights for depths: closer depths carry higher weight
-    raw_weights = [math.exp(-0.5 * i) for i in range(num_depths)]
-    sum_weights = sum(raw_weights)
-    weights = [w / sum_weights for w in raw_weights]
-
+    weights = _depth_weights(len(depths_bps))
     weighted_imbalance = 0.0
 
+    bid_idx = len(bids) - 1
+    ask_idx = 0
+    num_asks = len(asks)
+    bid_vol = 0.0
+    ask_vol = 0.0
+    prev_depth_bps = -math.inf
+
     for i, depth_bps in enumerate(depths_bps):
+        if depth_bps < prev_depth_bps:
+            bid_idx = len(bids) - 1
+            ask_idx = 0
+            bid_vol = 0.0
+            ask_vol = 0.0
+        prev_depth_bps = depth_bps
+
         depth_dec = depth_bps * 1e-4
         min_bid = best_bid_p * (1.0 - depth_dec)
         max_ask = best_ask_p * (1.0 + depth_dec)
 
-        # Sum bid quantities within [min_bid, best_bid_p]
-        bid_vol = sum(lvl.size for lvl in bids if lvl.price >= min_bid)
-        # Sum ask quantities within [best_ask_p, max_ask]
-        ask_vol = sum(lvl.size for lvl in asks if lvl.price <= max_ask)
+        while bid_idx >= 0 and bids[bid_idx].price >= min_bid:
+            bid_vol += bids[bid_idx].size
+            bid_idx -= 1
+
+        while ask_idx < num_asks and asks[ask_idx].price <= max_ask:
+            ask_vol += asks[ask_idx].size
+            ask_idx += 1
 
         total_vol = bid_vol + ask_vol
-        if total_vol > 0.0:
-            tier_imb = (bid_vol - ask_vol) / total_vol
-        else:
-            tier_imb = 0.0
-
+        tier_imb = (bid_vol - ask_vol) / total_vol if total_vol > 0.0 else 0.0
         weighted_imbalance += tier_imb * weights[i]
-
     return max(-1.0, min(1.0, weighted_imbalance))

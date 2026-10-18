@@ -435,3 +435,31 @@ class TestConfigValidation:
                 ),
                 cross_venue=CrossVenueConfig(enabled=True, venue=Venue.BYBIT, symbol="SOLUSDT"),
             )
+
+    def test_cross_venue_default_symbol_raises_when_enabled(self) -> None:
+        """CrossVenueConfig has no default symbol so enabling without symbol raises."""
+        with pytest.raises(ValueError, match="symbol must be non-empty when enabled"):
+            CrossVenueConfig(enabled=True)
+
+    def test_mismatched_cross_asset_pair_raises(self) -> None:
+        """PlainPricingEngine rejects cross_instrument with different base/quote asset."""
+        sol_cross = Instrument(
+            venue=Venue.BINANCE_USDM,
+            base=Asset("SOL"),
+            quote=Asset("USDT"),
+            symbol=Symbol("SOLUSDT"),
+            code=0,
+            instrument_type=InstrumentType.PERPETUAL,
+            tick_size=0.01,
+            lot_size=0.001,
+        )
+        with pytest.raises(ValueError, match="must match primary instrument"):
+            _build_skew_pricing(cross_instrument=sol_cross)
+
+    def test_stinky_trader_does_not_support_cross_venue(self) -> None:
+        """PlainTrader opts into cross_venue while StinkyTrader opts out."""
+        from smm.traders.plain.trader import PlainTrader
+        from smm.traders.stinky.trader import StinkyTrader
+
+        assert PlainTrader.supports_cross_venue is True
+        assert StinkyTrader.supports_cross_venue is False

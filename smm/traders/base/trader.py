@@ -18,6 +18,7 @@ from framework.base.stream.models import (
     DataMsg,
     DataStreamEvent,
     DataStreamEventMsg,
+    MarketDataStreamType,
 )
 from framework.base.trading.exchange import Exchange
 from framework.loader import VenueBundle, load_venue_bundle
@@ -46,6 +47,7 @@ class BaseTrader(ABC):
         producer_buffer (GenericRingBuffer): Stream ring buffer.
         oms (BaseOrderManagementSystem | None): OMS implementation.
     """
+    supports_cross_venue: bool = False
 
     def __init__(
         self,
@@ -104,43 +106,56 @@ class BaseTrader(ABC):
         """
         venue_bundle = load_venue_bundle(config.core.venue)
         exchange = cls._build_exchange(config.core.venue, logger)
-        instrument = await exchange.resolve_instrument(config.core.symbol)
-        rounder = await cls._build_rounder(exchange, instrument)
-        buffer: GenericRingBuffer = GenericRingBuffer(STREAM_MESSAGE_BUFFER_CAPACITY)
-        market_data = await cls._build_market_data(
-            venue_bundle, config.core.venue, exchange, logger, buffer
-        )
-        private_data = await cls._build_private_data(
-            venue_bundle, config.core.venue, exchange, logger, buffer
-        )
         cross_exchange: Exchange | None = None
-        cross_instrument: Instrument | None = None
-        cross_market_data: MarketStreamManager | None = None
+        try:
+            instrument = await exchange.resolve_instrument(config.core.symbol)
+            rounder = await cls._build_rounder(exchange, instrument)
+            buffer: GenericRingBuffer = GenericRingBuffer(STREAM_MESSAGE_BUFFER_CAPACITY)
+            market_data = await cls._build_market_data(
+                venue_bundle, config.core.venue, exchange, logger, buffer
+            )
+            private_data = await cls._build_private_data(
+                venue_bundle, config.core.venue, exchange, logger, buffer
+            )
+            cross_instrument: Instrument | None = None
+            cross_market_data: MarketStreamManager | None = None
 
-        if config.cross_venue.enabled:
-            if (
-                config.cross_venue.venue == config.core.venue
-                and config.cross_venue.symbol == config.core.symbol
-            ):
-                raise ValueError(
-                    f"cross_venue ({config.cross_venue.venue}, {config.cross_venue.symbol}) "
-                    f"cannot match primary venue and symbol"
+            if config.cross_venue.enabled and cls.supports_cross_venue:
+                if (
+                    config.cross_venue.venue == config.core.venue
+                    and config.cross_venue.symbol == config.core.symbol
+                ):
+                    raise ValueError(
+                        f"cross_venue ({config.cross_venue.venue}, {config.cross_venue.symbol}) "
+                        f"cannot match primary venue and symbol"
+                    )
+                cross_venue_bundle = load_venue_bundle(config.cross_venue.venue)
+                cross_exchange = cls._build_exchange(
+                    config.cross_venue.venue, logger, load_secrets=False
                 )
-            cross_venue_bundle = load_venue_bundle(config.cross_venue.venue)
-            cross_exchange = cls._build_exchange(
-                config.cross_venue.venue, logger, load_secrets=False
-            )
-            cross_instrument = await cross_exchange.resolve_instrument(
-                config.cross_venue.symbol
-            )
-            cross_market_data = await cls._build_market_data(
-                cross_venue_bundle,
-                config.cross_venue.venue,
-                cross_exchange,
-                logger,
-                buffer,
-            )
-
+                cross_instrument = await cross_exchange.resolve_instrument(
+                    config.cross_venue.symbol
+                )
+                if (
+                    cross_instrument.base != instrument.base
+                    or cross_instrument.quote != instrument.quote
+                ):
+                    raise ValueError(
+                        f"cross_venue asset pair ({cross_instrument.base}/{cross_instrument.quote}) "
+                        f"must match primary asset pair ({instrument.base}/{instrument.quote})"
+                    )
+                cross_market_data = await cls._build_market_data(
+                    cross_venue_bundle,
+                    config.cross_venue.venue,
+                    cross_exchange,
+                    logger,
+                    buffer,
+                )
+        except Exception:
+            await exchange.close_clients()
+            if cross_exchange is not None:
+                await cross_exchange.close_clients()
+            raise
         return cls(
             config=config,
             logger=logger,
@@ -292,7 +307,7 @@ class BaseTrader(ABC):
                 await self.cross_market_data.start()
                 await self.cross_market_data.subscribe(
                     instruments=[self.cross_instrument],
-                    stream_types=ALL_MARKET_DATA_STREAM_TYPES,
+                    stream_types={MarketDataStreamType.TOP_OF_ORDERBOOK},
                 )
 
             await self.market_data.subscribe(
@@ -325,7 +340,8 @@ class BaseTrader(ABC):
                     await self.received_heartbeat(msg)
                 case _:
                     await self.consume_msg(msg)
-                    await self.update_state()
+                    if getattr(msg, "instrument", self.instrument) == self.instrument:
+                        await self.update_state()
 
     @final
     async def received_heartbeat(self, msg: DataStreamEventMsg) -> None:

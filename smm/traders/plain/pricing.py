@@ -3,6 +3,9 @@
 Usage: instantiated by PlainTrader to generate desired quotes.
 Components: mid-price tracking, volatility spreads, inventory adjustments.
 """
+from __future__ import annotations
+
+import math
 
 from framework.base.common import ClientOrderId, Instrument
 from framework.base.stream.models import (
@@ -20,11 +23,14 @@ from smm.features import (
     bba_imbalance,
     log_price_difference,
     orderbook_imbalance,
+    volume_adjusted_mid_price,
     weighted_mid_price,
 )
 from smm.traders.base.pricing import BasePricingEngine
 from smm.traders.base.types import DesiredOrder, DesiredState
 from smm.traders.base.volatility import VolatilityEstimator
+
+
 class PlainPricingEngine(BasePricingEngine):
     """Pricing engine that builds symmetric quotes around the mid price.
 
@@ -54,6 +60,14 @@ class PlainPricingEngine(BasePricingEngine):
             cross_instrument (Instrument | None): Optional secondary reference instrument.
         """
         super().__init__(instrument=instrument, config=config)
+        if cross_instrument is not None and (
+            cross_instrument.base != instrument.base
+            or cross_instrument.quote != instrument.quote
+        ):
+            raise ValueError(
+                f"cross_instrument asset pair ({cross_instrument.base}/{cross_instrument.quote}) "
+                f"must match primary instrument ({instrument.base}/{instrument.quote})"
+            )
         self._plain_config = plain_config
         self._rounder = rounder
         self._volatility = volatility
@@ -62,9 +76,11 @@ class PlainPricingEngine(BasePricingEngine):
         self._mid_price: float = 0.0
         self._position_size: float = 0.0
         self._wmid_price: float = 0.0
+        self._vamp_price: float = 0.0
         self._cross_mid_price: float = 0.0
         self._cross_update_ns: int = 0
         self._last_primary_time_ns: int = 0
+        self._last_trade_recv_ns: int = 0
         self._has_full_depth: bool = False
         self._bba_imbalance: float = 0.0
         self._depth_imbalance: float = 0.0
@@ -80,6 +96,10 @@ class PlainPricingEngine(BasePricingEngine):
         """Return the current volume-weighted mid price."""
         return self._wmid_price
 
+    @property
+    def vamp_price(self) -> float:
+        """Return the current volume-adjusted mid price across depth."""
+        return self._vamp_price
     @property
     def bba_imbalance_value(self) -> float:
         """Return the top-of-book BBA volume imbalance."""
@@ -110,6 +130,7 @@ class PlainPricingEngine(BasePricingEngine):
             case TradeMsg():
                 if msg.instrument == self.instrument:
                     self._last_primary_time_ns = msg.moments.recv_time_ns
+                    self._last_trade_recv_ns = msg.moments.recv_time_ns
                     self._volatility.update_msg(msg)
                     self._trade_flow.update_trades(msg.trades)
             case OrderbookMsg():
@@ -124,8 +145,14 @@ class PlainPricingEngine(BasePricingEngine):
                     if not msg.is_bbo:
                         self._has_full_depth = True
                         self._depth_imbalance = orderbook_imbalance(msg.bids, msg.asks)
+                        self._vamp_price = volume_adjusted_mid_price(
+                            msg.bids, msg.asks, fallback_mid=self._mid_price
+                        )
                     elif not self._has_full_depth:
                         self._depth_imbalance = orderbook_imbalance(msg.bids, msg.asks)
+                        self._vamp_price = weighted_mid_price(
+                            msg.bids, msg.asks, fallback_mid=self._mid_price
+                        )
                     self._wmid_price = weighted_mid_price(
                         msg.bids, msg.asks, fallback_mid=self._mid_price
                     )
@@ -248,6 +275,14 @@ class PlainPricingEngine(BasePricingEngine):
     def _calculate_skew(self) -> float:
         """Calculate aggregate skew from micro-features and inventory."""
         trade_imb = self._trade_flow.imbalance()
+        if (
+            self._last_trade_recv_ns > 0
+            and self._last_primary_time_ns > self._last_trade_recv_ns
+        ):
+            quiet_s = (self._last_primary_time_ns - self._last_trade_recv_ns) / 1e9
+            trade_imb *= math.exp(
+                math.log(0.5) * quiet_s / self._trade_flow.half_life_s
+            )
         cross_spread = 0.0
         is_cross_fresh = False
         if self._cross_mid_price > 0.0 and self._cross_update_ns > 0:

@@ -166,6 +166,15 @@ class TestTradeFlowImbalance:
         # Because buys are more recent, imbalance should be positive
         assert flow.imbalance() > 0.0
 
+    def test_time_decay_after_quiet_period(self) -> None:
+        """Trade flow imbalance fades toward zero after a quiet period."""
+        flow = TradeFlowImbalance(window_size=10, half_life_s=10.0)
+        flow.update_trades((Trade(time_ms=1_000, price=100.0, size=5.0, is_buy=True),))
+        assert flow.imbalance(now_ms=1_000) == 1.0
+        # After one half-life (10 seconds = 10,000 ms), imbalance halves to 0.5
+        assert math.isclose(flow.imbalance(now_ms=11_000), 0.5, abs_tol=1e-5)
+        # After 100 seconds, imbalance is near 0.0
+        assert flow.imbalance(now_ms=101_000) < 0.001
 
 class TestMidPriceFeatures:
     """Tests for weighted mid-price, VAMP, and log price difference."""

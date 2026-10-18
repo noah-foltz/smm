@@ -28,6 +28,7 @@ from smm.traders.plain.risk import PlainRiskEngine
 class PlainTrader(BaseTrader):
     """Trader for the plain strategy."""
 
+    supports_cross_venue: bool = True
     oms: PlainOrderManagementSystem
 
     def __init__(

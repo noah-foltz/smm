@@ -62,8 +62,8 @@ def volume_adjusted_mid_price(
     if not bids or not asks or depth <= 0:
         return fallback_mid
 
-    top_bids = bids[-depth:] if len(bids) > depth else bids
-    top_asks = asks[:depth] if len(asks) > depth else asks
+    top_bids = bids[-depth:]
+    top_asks = asks[:depth]
 
     bid_qty = sum(lvl.size for lvl in top_bids)
     ask_qty = sum(lvl.size for lvl in top_asks)

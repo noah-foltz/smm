@@ -278,7 +278,7 @@ class CrossVenueConfig(msgspec.Struct):
 
     enabled: bool = False
     venue: Venue = Venue.BINANCE_USDM
-    symbol: Symbol = "BTCUSDT"
+    symbol: Symbol = ""
 
     def __post_init__(self) -> None:
         """Validate cross-venue configuration."""
